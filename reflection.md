@@ -60,7 +60,7 @@ classDiagram
     }
 
     class DailyPlan {
-        +date date
+        +date plan_date
         +list~ScheduledTask~ scheduled
         +dict skipped
         +total_minutes() int
