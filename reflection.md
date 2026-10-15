@@ -17,75 +17,20 @@
 
 Initial UML design: four classes. `Owner` holds the profile and daily constraints and owns the pets. `Pet` holds pet info and its tasks. `Task` holds one care activity (duration, priority). `Scheduler` takes an owner and builds a `DailyPlan`, which lists the scheduled tasks, the skipped tasks, and the reasoning for each decision.
 
-```mermaid
-classDiagram
-    class Owner {
-        +str name
-        +int available_minutes
-        +str preferences
-        +list~Pet~ pets
-        +add_pet(pet)
-        +remove_pet(pet)
-        +get_all_tasks() list~Task~
-    }
-
-    class Pet {
-        +str name
-        +str species
-        +str breed
-        +int age
-        +list~Task~ tasks
-        +add_task(task)
-        +remove_task(task_id)
-        +get_pending_tasks() list~Task~
-    }
-
-    class Task {
-        +str id
-        +str title
-        +str category
-        +int duration_minutes
-        +int priority
-        +time preferred_time
-        +bool completed
-        +mark_complete()
-        +update(changes)
-    }
-
-    class Scheduler {
-        +Owner owner
-        +generate_plan() DailyPlan
-        -sort_tasks(tasks) list~Task~
-        -explain_choice(task) str
-    }
-
-    class DailyPlan {
-        +date plan_date
-        +list~ScheduledTask~ scheduled
-        +dict skipped
-        +total_minutes() int
-        +summary() str
-    }
-
-    class ScheduledTask {
-        +Task task
-        +time start_time
-        +str reason
-        +end_time() time
-    }
-
-    Owner "1" o-- "*" Pet : has
-    Pet "1" *-- "*" Task : has
-    Scheduler --> Owner : reads constraints from
-    Scheduler ..> DailyPlan : creates
-    DailyPlan "1" *-- "*" ScheduledTask : contains
-    ScheduledTask --> Task : wraps
-```
-
 **b. Design changes**
 
 - Did your design change during implementation?
-- If yes, describe at least one change and why you made it. 
+- If yes, describe at least one change and why you made it.
+
+Yes. The design changed after I reviewed the class skeleton. Changes:
+
+- **Task now knows its pet.** `Task` has a `pet_id`, so a plan can say whose task it is. Before, `Owner.get_all_tasks()` returned a list and that link was lost.
+- **Ids and identity.** `Pet` and `Owner` got ids and are compared by identity, because dataclass equality on every field made two pets with identical fields equal. Task ids are generated, so they are unique across all pets.
+- **Day window instead of a single number.** `Owner` has `day_start` and `day_end`, and `available_minutes` is derived from them. A bare minutes budget could not place a task at a real start time or detect overlaps.
+- **Recurring tasks.** `Task` got `frequency` and `due_date`. A single `completed` flag cannot represent a task that's been completed twice.
+- **Scheduler details.** `generate_plan` takes a date, a `_find_slot` step handles preferred times and conflicts, and the explanation method is split into scheduled and skipped versions. `ScheduledTask` uses `datetime` so end times cannot wrap past midnight.
+- **Smaller cleanups.** Priority, category and frequency are enums, and duration is validated.
+
 
 ---
 

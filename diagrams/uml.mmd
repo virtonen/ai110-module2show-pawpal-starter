@@ -1,15 +1,20 @@
 classDiagram
     class Owner {
+        +str id
         +str name
-        +int available_minutes
+        +time day_start
+        +time day_end
         +str preferences
         +list~Pet~ pets
+        +int available_minutes
         +add_pet(pet)
-        +remove_pet(pet)
-        +get_all_tasks() list~Task~
+        +remove_pet(pet_id)
+        +get_pet(pet_id) Pet
+        +get_all_tasks(pending_only, on) list~Task~
     }
 
     class Pet {
+        +str id
         +str name
         +str species
         +str breed
@@ -17,26 +22,56 @@ classDiagram
         +list~Task~ tasks
         +add_task(task)
         +remove_task(task_id)
-        +get_pending_tasks() list~Task~
+        +get_pending_tasks(on) list~Task~
     }
 
     class Task {
         +str id
+        +str pet_id
         +str title
-        +str category
+        +Category category
         +int duration_minutes
-        +int priority
+        +Priority priority
         +time preferred_time
+        +Frequency frequency
+        +date due_date
         +bool completed
-        +mark_complete()
+        +is_due(on) bool
+        +mark_complete() Task
         +update(changes)
+    }
+
+    class Priority {
+        <<enumeration>>
+        LOW
+        MEDIUM
+        HIGH
+    }
+
+    class Category {
+        <<enumeration>>
+        WALK
+        FEEDING
+        MEDS
+        ENRICHMENT
+        GROOMING
+        OTHER
+    }
+
+    class Frequency {
+        <<enumeration>>
+        ONCE
+        DAILY
+        WEEKLY
     }
 
     class Scheduler {
         +Owner owner
-        +generate_plan() DailyPlan
+        +generate_plan(plan_date) DailyPlan
         -sort_tasks(tasks) list~Task~
-        -explain_choice(task) str
+        -find_slot(task, busy, plan_date) datetime
+        -explain_scheduled(task, start) str
+        -explain_skipped(task) str
     }
 
     class DailyPlan {
@@ -49,13 +84,18 @@ classDiagram
 
     class ScheduledTask {
         +Task task
-        +time start_time
+        +str pet_name
+        +datetime start
+        +datetime end
         +str reason
-        +end_time() time
     }
 
     Owner "1" o-- "*" Pet : has
     Pet "1" *-- "*" Task : has
+    Task "*" --> "1" Pet : pet_id refers to
+    Task --> Priority
+    Task --> Category
+    Task --> Frequency
     Scheduler --> Owner : reads constraints from
     Scheduler ..> DailyPlan : creates
     DailyPlan "1" *-- "*" ScheduledTask : contains
