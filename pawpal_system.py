@@ -10,6 +10,7 @@ from uuid import uuid4
 
 
 def _new_id() -> str:
+    """Return a new unique id (random uuid hex string)."""
     return uuid4().hex
 
 
@@ -80,7 +81,7 @@ class Task:
         )
 
     def update(self, changes: dict) -> None:
-        """Apply a dict of field changes to this task (re-validating them)."""
+        """Apply a dict of field changes; raise ValueError (and keep old values) if invalid."""
         protected = {"id", "pet_id"}
         for key in changes:
             if key in protected or not hasattr(self, key):
@@ -108,14 +109,14 @@ class Pet:
     tasks: list[Task] = field(default_factory=list)
 
     def add_task(self, task: Task) -> None:
-        """Add a task to this pet and set task.pet_id."""
+        """Add a task to this pet and set task.pet_id; raise ValueError on a duplicate id."""
         if any(t.id == task.id for t in self.tasks):
             raise ValueError(f"task id already exists: {task.id}")
         task.pet_id = self.id
         self.tasks.append(task)
 
     def remove_task(self, task_id: str) -> None:
-        """Remove the task with the given id."""
+        """Remove the task with the given id; raise KeyError if there is none."""
         for i, task in enumerate(self.tasks):
             if task.id == task_id:
                 del self.tasks[i]
@@ -157,13 +158,13 @@ class Owner:
         return max(0, int((end - start).total_seconds() // 60))
 
     def add_pet(self, pet: Pet) -> None:
-        """Add a pet to this owner."""
+        """Add a pet to this owner; raise ValueError on a duplicate id."""
         if self.get_pet(pet.id) is not None:
             raise ValueError(f"pet id already exists: {pet.id}")
         self.pets.append(pet)
 
     def remove_pet(self, pet_id: str) -> None:
-        """Remove the pet with the given id."""
+        """Remove the pet with the given id; raise KeyError if there is none."""
         pet = self.get_pet(pet_id)
         if pet is None:
             raise KeyError(f"no pet with id {pet_id}")
@@ -235,6 +236,7 @@ class Scheduler:
     """
 
     def __init__(self, owner: Owner) -> None:
+        """Create a scheduler that plans for the given owner (and all their pets)."""
         self.owner = owner
 
     def generate_plan(self, plan_date: date | None = None) -> DailyPlan:
