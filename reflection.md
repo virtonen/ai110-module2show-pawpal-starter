@@ -77,13 +77,14 @@ To verify the result, I ran `main.py` myself in the terminal and checked the pla
 - What behaviors did you test?
 - Why were these tests important?
 
-With Claude's help I wrote 73 pytest tests in `tests/test_pawpal.py`, grouped around the behaviors where a bug would hurt the owner most:
+With Claude's help I wrote 118 pytest tests in `tests/test_pawpal.py`, grouped around the behaviors where a bug would hurt the owner most:
 
 - **Sorting.** Tasks come back in chronological order, tasks with no time go last, and ties are broken by priority and then title, so the order is the same on every run.
 - **Recurrence.** Completing a daily or weekly task creates exactly one new copy, due 1 or 7 days later. I covered overdue and early completion, leap days and year ends. Completing a task twice makes no duplicate, and a one-time task makes none.
 - **Conflict detection.** The scheduler flags overlapping times, including two tasks at exactly the same time and tasks for different pets. It ignores completed, untimed and not-yet-due tasks.
 - **Plan generation.** Only due tasks are planned. The higher-priority task keeps its time, the other moves to the nearest free slot, and fixed tasks never move. A randomized test checks 200 plans for overlaps and tasks outside the day.
 - **Edge cases.** A pet with no tasks, an owner with no pets, a task ending exactly at the end of the day, and a day too short for any task.
+- **Next available slot.** The earliest free gap of a given length: empty day, gaps between tasks, exact fits, no free slot, a search start time, and that a task placed at the suggested time moves nothing else.
 - **Bad input.** Empty titles, non-positive durations, duplicate or missing ids, and `Task.update` rolling back every field when one value is invalid.
 
 These mattered because the scheduler's output looks plausible even when it is wrong. A plan that double-books the owner, or a missed recurring task, does not crash anything, so only a test would catch it. The `generate_plan` tests with future-dated and completed tasks were the most important ones to add, since a mistake there would put the wrong tasks in the plan without any error.
@@ -93,7 +94,7 @@ These mattered because the scheduler's output looks plausible even when it is wr
 - How confident are you that your scheduler works correctly?
 - What edge cases would you test next if you had more time?
 
-I give it 4 out of 5. All 73 tests pass, and they cover the core rules: plans never overlap or leave the day, priority wins a clash, recurrence dates are right, and bad input is rejected without changing data. The tests did not turn up any bugs in the scheduler itself, so I treat that as good news but not proof, because I did not break the code on purpose to check that the new tests fail when they should.
+I give it 4 out of 5. All 118 tests pass, and they cover the core rules: plans never overlap or leave the day, priority wins a clash, recurrence dates are right, and bad input is rejected without changing data. The tests did not turn up any bugs in the scheduler itself, so I treat that as good news but not proof, because I did not break the code on purpose to check that the new tests fail when they should.
 
 I stop at 4 because:
 

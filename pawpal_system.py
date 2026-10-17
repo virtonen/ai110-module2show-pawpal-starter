@@ -2,19 +2,25 @@
 
 from __future__ import annotations
 
+import json
+import os
 from bisect import bisect_left, insort
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from enum import Enum, IntEnum
-from typing import NamedTuple
+from pathlib import Path
+from typing import Any, NamedTuple
 from uuid import uuid4
 
 
 def _new_id() -> str:
     """Return a new unique id (random uuid hex string)."""
     return uuid4().hex
+
+
+DATA_VERSION = 1  # bump if the saved format changes
 
 
 class Priority(IntEnum):
@@ -97,6 +103,42 @@ class Task:
             due_date=max(self.due_date or on, on) + step,
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly dict: enums as names or values, times and dates as ISO text."""
+        return {
+            "id": self.id,
+            "pet_id": self.pet_id,
+            "title": self.title,
+            "category": self.category.value,
+            "duration_minutes": self.duration_minutes,
+            "priority": self.priority.name,
+            "preferred_time": self.preferred_time.isoformat() if self.preferred_time else None,
+            "frequency": self.frequency.value,
+            "due_date": self.due_date.isoformat() if self.due_date else None,
+            "completed": self.completed,
+            "fixed": self.fixed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Task:
+        """Rebuild a Task saved by `to_dict`; the constructor re-validates every field.
+        Raises ValueError (or KeyError/TypeError) if the data is malformed."""
+        preferred = data["preferred_time"]
+        due = data["due_date"]
+        return cls(
+            title=data["title"],
+            category=Category(data["category"]),
+            duration_minutes=data["duration_minutes"],
+            priority=Priority[data["priority"]],
+            id=data["id"],
+            pet_id=data["pet_id"],
+            preferred_time=time.fromisoformat(preferred) if preferred else None,
+            frequency=Frequency(data["frequency"]),
+            due_date=date.fromisoformat(due) if due else None,
+            completed=data["completed"],
+            fixed=data["fixed"],
+        )
+
     def update(self, changes: dict) -> None:
         """Apply a dict of field changes; raise ValueError (and keep old values) if invalid."""
         protected = {"id", "pet_id"}
@@ -154,6 +196,32 @@ class Pet:
         """Return tasks that are not completed and due on `on` (default: today)."""
         on = on or date.today()
         return [t for t in self.tasks if t.is_due(on)]
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly dict of the pet and all of its tasks."""
+        return {
+            "id": self.id,
+            "name": self.name,
+            "species": self.species,
+            "breed": self.breed,
+            "age": self.age,
+            "tasks": [t.to_dict() for t in self.tasks],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Pet:
+        """Rebuild a Pet and its tasks saved by `to_dict`. Each task keeps its saved
+        id, and `add_task` re-checks for duplicate ids and re-links `pet_id`."""
+        pet = cls(
+            name=data["name"],
+            species=data["species"],
+            id=data["id"],
+            breed=data["breed"],
+            age=data["age"],
+        )
+        for task_data in data["tasks"]:
+            pet.add_task(Task.from_dict(task_data))
+        return pet
 
 
 @dataclass(eq=False)
@@ -227,6 +295,64 @@ class Owner:
             for task in pet.tasks
             if checks[status](task)
         ]
+
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-friendly dict of the owner, their pets and every task."""
+        return {
+            "version": DATA_VERSION,
+            "id": self.id,
+            "name": self.name,
+            "day_start": self.day_start.isoformat(),
+            "day_end": self.day_end.isoformat(),
+            "preferences": self.preferences,
+            "pets": [p.to_dict() for p in self.pets],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Owner:
+        """Rebuild an Owner saved by `to_dict`. Raises ValueError if the data is
+        malformed, from a newer version, or fails any validation."""
+        try:
+            if data["version"] != DATA_VERSION:
+                raise ValueError(f"unsupported data version: {data['version']}")
+            owner = cls(
+                name=data["name"],
+                id=data["id"],
+                day_start=time.fromisoformat(data["day_start"]),
+                day_end=time.fromisoformat(data["day_end"]),
+                preferences=data["preferences"],
+            )
+            for pet_data in data["pets"]:
+                owner.add_pet(Pet.from_dict(pet_data))
+        except (KeyError, TypeError, AttributeError) as err:
+            raise ValueError(f"invalid saved data: {err!r}") from err
+        return owner
+
+    def save_to_json(self, path: str | Path = "data.json") -> None:
+        """Write the owner, pets and tasks to `path` as readable JSON.
+
+        The data goes to a temporary file first and is then moved into place, so a
+        crash or a full disk mid-write cannot leave a half-written data file."""
+        path = Path(path)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+
+    @classmethod
+    def load_from_json(cls, path: str | Path = "data.json") -> Owner:
+        """Read an owner saved by `save_to_json`.
+
+        Raises FileNotFoundError if there is no file yet, and ValueError if the
+        file is not valid JSON or does not hold valid PawPal+ data."""
+        path = Path(path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as err:
+            raise ValueError(f"{path.name} is not valid JSON: {err}") from err
+        if not isinstance(data, dict):
+            raise ValueError(f"{path.name} does not hold a PawPal+ data object")
+        return cls.from_dict(data)
 
 
 def sort_by_time(tasks: list[Task]) -> list[Task]:
@@ -437,6 +563,37 @@ class Scheduler:
             if latest_end is None or end > latest_end:
                 latest, latest_end = t, end
         return conflicts
+
+    def next_available_slot(
+        self,
+        duration_minutes: int,
+        plan_date: date | None = None,
+        after: time | None = None,
+    ) -> datetime | None:
+        """Return the earliest start for a new task of this length, or None.
+
+        The search runs on the plan `generate_plan` would build for `plan_date`
+        (default: today), so the answer already accounts for every due task and
+        for tasks that were moved. Only gaps at or after `after` (default: the
+        start of the owner's day) are considered, and the slot must end by the
+        owner's `day_end`. Adding a task at the returned time does not move any
+        existing task, unlike adding it at a time that clashes."""
+        if duration_minutes <= 0:
+            raise ValueError("duration_minutes must be positive")
+        plan_date = plan_date or date.today()
+        plan = self.generate_plan(plan_date)
+        day = _Day(
+            datetime.combine(plan_date, self.owner.day_start),
+            datetime.combine(plan_date, self.owner.day_end),
+        )
+        earliest = max(day.start, datetime.combine(plan_date, after or time.min))
+        length = timedelta(minutes=duration_minutes)
+        blocked = sorted((item.start, item.end) for item in plan.scheduled)
+        for gap_start, gap_end in _free_gaps(blocked, day):
+            start = max(gap_start, earliest)
+            if gap_end - start >= length:
+                return start
+        return None
 
     def sort_by_time(self, tasks: list[Task] | None = None) -> list[Task]:
         """Return tasks (default: all pending tasks) ordered by preferred time.

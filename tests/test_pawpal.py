@@ -705,3 +705,295 @@ def test_duplicate_times_are_flagged_and_the_plan_still_has_no_overlap():
     assert starts(plan)["Feed"] != time(9, 0)  # the other was moved, not dropped
     a, b = sorted(plan.scheduled, key=lambda i: i.start)
     assert a.end <= b.start
+
+
+# ---- next available slot -------------------------------------------------------------------
+
+
+def test_next_slot_on_an_empty_day_is_the_start_of_the_day():
+    owner, _ = make()
+    assert Scheduler(owner).next_available_slot(30, DAY) == dt(8)
+
+
+def test_next_slot_skips_past_planned_tasks():
+    owner, pet = make()
+    pet.add_task(t("Walk", 60, at=time(8, 0)))
+    pet.add_task(t("Vet", 30, at=time(9, 0)))
+    assert Scheduler(owner).next_available_slot(30, DAY) == dt(9, 30)
+
+
+def test_next_slot_uses_a_gap_between_tasks_when_it_is_big_enough():
+    owner, pet = make()
+    pet.add_task(t("A", 60, at=time(8, 0)))
+    pet.add_task(t("B", 60, at=time(10, 0)))
+    sched = Scheduler(owner)
+    assert sched.next_available_slot(60, DAY) == dt(9)  # gap is exactly 60 min
+    assert sched.next_available_slot(61, DAY) == dt(11)  # gap too small, goes after B
+
+
+def test_next_slot_respects_the_after_time():
+    owner, pet = make()
+    pet.add_task(t("A", 30, at=time(8, 0)))
+    sched = Scheduler(owner)
+    assert sched.next_available_slot(30, DAY, after=time(12, 15)) == dt(12, 15)
+    assert sched.next_available_slot(30, DAY, after=time(6, 0)) == dt(8, 30)  # clamped to the day
+
+
+def test_next_slot_may_start_inside_a_gap_after_the_after_time():
+    owner, pet = make()
+    pet.add_task(t("A", 120, at=time(8, 0)))  # 08:00-10:00
+    pet.add_task(t("B", 60, at=time(13, 0)))  # 13:00-14:00
+    assert Scheduler(owner).next_available_slot(60, DAY, after=time(11, 0)) == dt(11)
+
+
+def test_next_slot_slot_may_end_exactly_at_day_end():
+    owner, pet = make(owner_end=time(10, 0))
+    pet.add_task(t("A", 60, at=time(8, 0)))
+    sched = Scheduler(owner)
+    assert sched.next_available_slot(60, DAY) == dt(9)
+    assert sched.next_available_slot(61, DAY) is None
+
+
+def test_next_slot_is_none_when_the_day_is_full_or_after_is_too_late():
+    owner, pet = make(owner_end=time(9, 0))
+    pet.add_task(t("A", 60, at=time(8, 0)))
+    sched = Scheduler(owner)
+    assert sched.next_available_slot(5, DAY) is None
+    owner2, _ = make()
+    assert Scheduler(owner2).next_available_slot(30, DAY, after=time(19, 45)) is None
+
+
+def test_next_slot_accounts_for_tasks_that_were_moved_by_the_planner():
+    owner, pet = make()
+    pet.add_task(t("Vet", 60, Priority.HIGH, time(9, 0)))
+    pet.add_task(t("Play", 30, Priority.LOW, time(9, 0)))  # pushed to 08:30
+    # busy: 08:30-09:00 (Play) and 09:00-10:00 (Vet); first free 30 min is 08:00-08:30
+    assert Scheduler(owner).next_available_slot(30, DAY) == dt(8)
+    assert Scheduler(owner).next_available_slot(60, DAY) == dt(10)
+
+
+def test_next_slot_ignores_completed_and_future_tasks():
+    owner, pet = make()
+    done = t("Done", 60, at=time(8, 0))
+    done.completed = True
+    pet.add_task(done)
+    pet.add_task(t("Later", 60, at=time(8, 0), due_date=DAY + timedelta(days=1)))
+    assert Scheduler(owner).next_available_slot(60, DAY) == dt(8)
+
+
+def test_next_slot_returns_a_slot_where_a_new_task_moves_nothing():
+    owner, pet = make()
+    pet.add_task(t("A", 45, Priority.HIGH, time(9, 0)))
+    pet.add_task(t("B", 30, Priority.MEDIUM, time(9, 30)))
+    sched = Scheduler(owner)
+    before = starts(sched.generate_plan(DAY))
+    slot = sched.next_available_slot(40, DAY, after=time(9, 0))
+    pet.add_task(t("New", 40, Priority.LOW, slot.time()))
+    after = sched.generate_plan(DAY)
+    assert starts(after)["New"] == slot.time()
+    assert {k: v for k, v in starts(after).items() if k != "New"} == before
+
+
+@pytest.mark.parametrize("minutes", [0, -5])
+def test_next_slot_rejects_non_positive_duration(minutes):
+    owner, _ = make()
+    with pytest.raises(ValueError):
+        Scheduler(owner).next_available_slot(minutes, DAY)
+
+
+def test_next_slot_does_not_change_any_task():
+    owner, pet = make()
+    pet.add_task(t("A", 30, Priority.HIGH, time(9, 0)))
+    pet.add_task(t("B", 30, Priority.LOW, time(9, 0)))
+    snapshot = [_replace(x) for x in pet.tasks]
+    Scheduler(owner).next_available_slot(30, DAY)
+    assert pet.tasks == snapshot
+
+
+# ---- persistence: save_to_json / load_from_json ---------------------------------------------
+
+import json
+
+
+def full_household():
+    """An owner whose tasks use every field type: enums, times, dates, flags."""
+    owner = Owner(name="Sam Ö", day_start=time(7, 30), day_end=time(21, 15),
+                  preferences="no walks before 8")
+    rex = Pet(name="Rex", species="dog", breed="Lab", age=4)
+    mia = Pet(name="Mia", species="cat")
+    owner.add_pet(rex)
+    owner.add_pet(mia)
+    rex.add_task(Task("Walk", Category.WALK, 45, Priority.HIGH, preferred_time=time(8, 30),
+                      frequency=Frequency.DAILY, due_date=DAY))
+    rex.add_task(Task("Meds", Category.MEDS, 5, Priority.HIGH, preferred_time=time(9, 0),
+                      fixed=True, frequency=Frequency.WEEKLY))
+    mia.add_task(Task("Groom", Category.GROOMING, 20, Priority.LOW))
+    done = Task("Feed", Category.FEEDING, 10, Priority.MEDIUM, due_date=DAY - timedelta(days=1))
+    done.completed = True
+    mia.add_task(done)
+    return owner
+
+
+def test_save_then_load_gives_identical_data(tmp_path):
+    owner = full_household()
+    path = tmp_path / "data.json"
+    owner.save_to_json(path)
+    loaded = Owner.load_from_json(path)
+    assert loaded.to_dict() == owner.to_dict()  # every field of every object
+    assert loaded is not owner and loaded.pets[0] is not owner.pets[0]
+
+
+def test_loaded_objects_have_the_right_types_and_links(tmp_path):
+    owner = full_household()
+    owner.save_to_json(tmp_path / "data.json")
+    loaded = Owner.load_from_json(tmp_path / "data.json")
+    rex = loaded.get_pet(owner.pets[0].id)
+    walk = next(x for x in rex.tasks if x.title == "Walk")
+    assert walk.priority is Priority.HIGH and walk.category is Category.WALK
+    assert walk.frequency is Frequency.DAILY
+    assert walk.preferred_time == time(8, 30) and walk.due_date == DAY
+    assert walk.pet_id == rex.id and loaded.get_pet(walk.pet_id) is rex
+    assert next(x for x in rex.tasks if x.title == "Meds").fixed is True
+    assert loaded.day_start == time(7, 30) and loaded.day_end == time(21, 15)
+    assert loaded.name == "Sam Ö"  # non-ASCII survives
+
+
+def test_a_loaded_household_plans_exactly_like_the_original(tmp_path):
+    owner = full_household()
+    owner.save_to_json(tmp_path / "data.json")
+    loaded = Owner.load_from_json(tmp_path / "data.json")
+    before = Scheduler(owner).generate_plan(DAY)
+    after = Scheduler(loaded).generate_plan(DAY)
+    assert [(i.task.id, i.start, i.reason) for i in after.scheduled] == [
+        (i.task.id, i.start, i.reason) for i in before.scheduled]
+    assert [s.task.id for s in after.skipped] == [s.task.id for s in before.skipped]
+
+
+def test_recurrence_still_works_after_a_save_and_load(tmp_path):
+    owner = full_household()
+    owner.save_to_json(tmp_path / "data.json")
+    loaded = Owner.load_from_json(tmp_path / "data.json")
+    rex = loaded.pets[0]
+    walk = next(x for x in rex.tasks if x.title == "Walk")
+    nxt = rex.complete_task(walk.id, on=DAY)
+    assert nxt.due_date == DAY + timedelta(days=1) and nxt.id != walk.id
+    loaded.save_to_json(tmp_path / "data.json")  # and it can be saved again
+    again = Owner.load_from_json(tmp_path / "data.json")
+    assert len(again.pets[0].tasks) == len(rex.tasks)
+
+
+def test_changes_survive_between_runs(tmp_path):
+    path = tmp_path / "data.json"
+    owner = Owner(name="Sam")
+    owner.save_to_json(path)  # run 1: empty
+    run2 = Owner.load_from_json(path)
+    pet = Pet(name="Rex", species="dog")
+    run2.add_pet(pet)
+    pet.add_task(t("Walk", at=time(9, 0)))
+    run2.save_to_json(path)
+    run3 = Owner.load_from_json(path)  # run 3 sees what run 2 saved
+    assert [p.name for p in run3.pets] == ["Rex"]
+    assert [x.title for x in run3.pets[0].tasks] == ["Walk"]
+
+
+def test_empty_owner_and_pet_without_tasks_round_trip(tmp_path):
+    owner = Owner(name="Solo")
+    owner.save_to_json(tmp_path / "a.json")
+    assert Owner.load_from_json(tmp_path / "a.json").pets == []
+    owner.add_pet(Pet(name="Rex", species="dog"))
+    owner.save_to_json(tmp_path / "b.json")
+    assert Owner.load_from_json(tmp_path / "b.json").pets[0].tasks == []
+
+
+def test_saved_file_is_readable_json_with_a_version(tmp_path):
+    path = tmp_path / "data.json"
+    full_household().save_to_json(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["version"] == 1 and data["pets"][0]["tasks"][0]["priority"] == "HIGH"
+    assert data["pets"][0]["tasks"][0]["preferred_time"] == "08:30:00"
+    assert "\n" in path.read_text()  # indented, so people can read it
+
+
+def test_saving_overwrites_the_old_file_and_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "data.json"
+    owner = full_household()
+    owner.save_to_json(path)
+    owner.name = "Renamed"
+    owner.save_to_json(path)
+    assert Owner.load_from_json(path).name == "Renamed"
+    assert [p.name for p in tmp_path.iterdir()] == ["data.json"]
+
+
+def test_default_path_is_data_json_in_the_working_directory(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    full_household().save_to_json()
+    assert (tmp_path / "data.json").exists()
+    assert Owner.load_from_json().name == "Sam Ö"
+
+
+def test_loading_a_missing_file_raises_file_not_found(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        Owner.load_from_json(tmp_path / "nope.json")
+
+
+@pytest.mark.parametrize("text", ["", "{not json", "[]", "null", '"text"'])
+def test_loading_garbage_raises_value_error(tmp_path, text):
+    path = tmp_path / "data.json"
+    path.write_text(text)
+    with pytest.raises(ValueError):
+        Owner.load_from_json(path)
+
+
+def _saved(tmp_path):
+    path = tmp_path / "data.json"
+    full_household().save_to_json(path)
+    return path, json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write(path, data):
+    path.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda d: d.pop("version"),
+        lambda d: d.update(version=99),
+        lambda d: d.pop("pets"),
+        lambda d: d.update(day_start="not a time"),
+        lambda d: d["pets"][0]["tasks"][0].update(priority="URGENT"),
+        lambda d: d["pets"][0]["tasks"][0].update(category="swimming"),
+        lambda d: d["pets"][0]["tasks"][0].update(frequency="hourly"),
+        lambda d: d["pets"][0]["tasks"][0].update(duration_minutes=0),
+        lambda d: d["pets"][0]["tasks"][0].update(duration_minutes="long"),
+        lambda d: d["pets"][0]["tasks"][0].update(title=" "),
+        lambda d: d["pets"][0]["tasks"][0].update(due_date="2026-13-45"),
+        lambda d: d["pets"][0]["tasks"][0].pop("id"),
+        lambda d: d["pets"][0]["tasks"][1].update(preferred_time=None),  # fixed needs a time
+        lambda d: d["pets"][0]["tasks"].append(dict(d["pets"][0]["tasks"][0])),  # duplicate id
+        lambda d: d["pets"].append(dict(d["pets"][0])),  # duplicate pet id
+    ],
+)
+def test_loading_invalid_data_raises_value_error(tmp_path, mutate):
+    path, data = _saved(tmp_path)
+    mutate(data)
+    _write(path, data)
+    with pytest.raises(ValueError):
+        Owner.load_from_json(path)
+
+
+def test_a_failed_load_leaves_the_file_untouched(tmp_path):
+    path = tmp_path / "data.json"
+    path.write_text("{broken")
+    with pytest.raises(ValueError):
+        Owner.load_from_json(path)
+    assert path.read_text() == "{broken"
+
+
+def test_task_and_pet_round_trip_individually():
+    task = t("Walk", 30, Priority.LOW, time(6, 5), frequency=Frequency.WEEKLY,
+             due_date=DAY, fixed=True)
+    assert Task.from_dict(task.to_dict()) == task
+    pet = Pet(name="Rex", species="dog", breed="Lab", age=3)
+    pet.add_task(task)
+    assert Pet.from_dict(pet.to_dict()).to_dict() == pet.to_dict()

@@ -1,4 +1,5 @@
-from datetime import date, time
+from datetime import date, time, timedelta
+from pathlib import Path
 
 import streamlit as st
 
@@ -24,11 +25,39 @@ st.divider()
 
 st.subheader("Owner and Pets")
 
-# The vault: create the Owner once per session, then reuse the same object on every rerun.
-if "owner" not in st.session_state:
-    st.session_state.owner = Owner(name="Jordan")
-owner = st.session_state.owner
+DATA_FILE = Path(__file__).parent / "data.json"
 
+
+def _load_owner() -> Owner:
+    """Load the saved household, or start fresh if there is none (or it is damaged)."""
+    try:
+        return Owner.load_from_json(DATA_FILE)
+    except FileNotFoundError:
+        return Owner(name="Jordan")
+    except ValueError as err:
+        # Keep the unreadable file for inspection, then start fresh.
+        backup = DATA_FILE.with_name(DATA_FILE.name + ".corrupt")
+        DATA_FILE.replace(backup)
+        st.session_state.load_warning = (
+            f"Saved data could not be read ({err}). It was kept as {backup.name}; "
+            "starting with an empty household."
+        )
+        return Owner(name="Jordan")
+
+
+def _save() -> None:
+    """Write the household to data.json so it is still there on the next run."""
+    owner.save_to_json(DATA_FILE)
+
+
+# The vault: load the Owner once per session, then reuse the same object on every rerun.
+if "owner" not in st.session_state:
+    st.session_state.owner = _load_owner()
+owner = st.session_state.owner
+if "load_warning" in st.session_state:
+    st.warning(st.session_state.load_warning)
+
+saved_profile = (owner.name, owner.day_start, owner.day_end)
 owner.name = st.text_input("Owner name", value=owner.name)
 
 col1, col2 = st.columns(2)
@@ -40,6 +69,8 @@ if day_end > day_start:
     owner.day_start, owner.day_end = day_start, day_end
 else:
     st.error("The day must end after it starts. Using the previous window.")
+if (owner.name, owner.day_start, owner.day_end) != saved_profile:
+    _save()
 
 col1, col2 = st.columns(2)
 with col1:
@@ -52,6 +83,7 @@ if st.button("Add pet"):
         st.error("Pet name must not be empty.")
     else:
         owner.add_pet(Pet(name=pet_name.strip(), species=species))
+        _save()
 
 scheduler = Scheduler(owner)
 
@@ -115,6 +147,17 @@ else:
         help="For things like medication. Needs a preferred time.",
     )
 
+    if st.button("Suggest a free time"):
+        slot = scheduler.next_available_slot(int(duration))
+        if slot is None:
+            st.info(f"No free {int(duration)}-minute slot is left today.")
+        else:
+            st.info(
+                f"Next free {int(duration)}-minute slot today: **{slot:%H:%M}** "
+                f"(until {slot + timedelta(minutes=int(duration)):%H:%M}). "
+                "Set it as the preferred time and nothing else will move."
+            )
+
     if st.button("Add task"):
         try:
             new_task = Task(
@@ -125,6 +168,7 @@ else:
         except ValueError as err:
             st.error(str(err))
         else:
+            _save()
             st.success(f"Added {new_task.title} for {pet.name}.")
             # Lightweight check: warn about clashes with the new task, never block it.
             preview = scheduler.generate_plan()
@@ -140,6 +184,7 @@ def _complete(task_id: str, pet_id: str) -> None:
     done_pet = owner.get_pet(pet_id)
     title = next(t.title for t in done_pet.tasks if t.id == task_id)
     next_task = done_pet.complete_task(task_id)
+    _save()
     st.session_state.flash = (
         f"Completed {title}. Next one is due {next_task.due_date:%A, %B %d}."
         if next_task
@@ -171,7 +216,7 @@ else:
         st.table(
             [
                 {
-                    "time": f"{t.preferred_time:%H:%M}" if t.preferred_time else "-",
+                    "time": f"{t.preferred_time:%H:%M}" if t.preferred_time else "any time",
                     "task": t.title,
                     "pet": owner.get_pet(t.pet_id).name,
                     "min": t.duration_minutes,

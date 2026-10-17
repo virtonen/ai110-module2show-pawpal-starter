@@ -12,6 +12,10 @@ classDiagram
         +get_pet(pet_id) Pet
         +get_all_tasks(pending_only, on) list~Task~
         +filter_tasks(pet_name, status, on) list~Task~
+        +to_dict() dict
+        +from_dict(data) Owner$
+        +save_to_json(path)
+        +load_from_json(path) Owner$
     }
 
     class Pet {
@@ -25,6 +29,8 @@ classDiagram
         +remove_task(task_id)
         +complete_task(task_id, on) Task
         +get_pending_tasks(on) list~Task~
+        +to_dict() dict
+        +from_dict(data) Pet$
     }
 
     class Task {
@@ -43,6 +49,8 @@ classDiagram
         +is_overdue(on) bool
         +mark_complete(on) Task
         +update(changes)
+        +to_dict() dict
+        +from_dict(data) Task$
     }
 
     class Priority {
@@ -73,6 +81,7 @@ classDiagram
         +Owner owner
         +generate_plan(plan_date) DailyPlan
         +find_conflicts(tasks, plan_date) list~Conflict~
+        +next_available_slot(duration_minutes, plan_date, after) datetime
         +sort_by_time(tasks) list~Task~
         +filter_tasks(pet_name, status, on) list~Task~
         -pet_name(task) str
