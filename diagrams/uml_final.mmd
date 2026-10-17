@@ -11,6 +11,7 @@ classDiagram
         +remove_pet(pet_id)
         +get_pet(pet_id) Pet
         +get_all_tasks(pending_only, on) list~Task~
+        +filter_tasks(pet_name, status, on) list~Task~
     }
 
     class Pet {
@@ -22,6 +23,7 @@ classDiagram
         +list~Task~ tasks
         +add_task(task)
         +remove_task(task_id)
+        +complete_task(task_id, on) Task
         +get_pending_tasks(on) list~Task~
     }
 
@@ -36,8 +38,10 @@ classDiagram
         +Frequency frequency
         +date due_date
         +bool completed
+        +bool fixed
         +is_due(on) bool
-        +mark_complete() Task
+        +is_overdue(on) bool
+        +mark_complete(on) Task
         +update(changes)
     }
 
@@ -68,8 +72,14 @@ classDiagram
     class Scheduler {
         +Owner owner
         +generate_plan(plan_date) DailyPlan
+        +find_conflicts(tasks, plan_date) list~Conflict~
+        +sort_by_time(tasks) list~Task~
+        +filter_tasks(pet_name, status, on) list~Task~
+        -pet_name(task) str
+        -window(task, plan_date) tuple
         -sort_tasks(tasks) list~Task~
-        -find_slot(task, busy, plan_date) datetime
+        -find_slot(task, busy, holds, day) datetime
+        -nearest_slot(task, blocked, day) datetime
         -explain_scheduled(task, start) str
         -explain_skipped(task) str
     }
@@ -77,7 +87,7 @@ classDiagram
     class DailyPlan {
         +date plan_date
         +list~ScheduledTask~ scheduled
-        +dict skipped
+        +list~SkippedTask~ skipped
         +total_minutes() int
         +summary() str
     }
@@ -86,8 +96,32 @@ classDiagram
         +Task task
         +str pet_name
         +datetime start
-        +datetime end
         +str reason
+        +datetime end
+    }
+
+    class SkippedTask {
+        +Task task
+        +str reason
+    }
+
+    class Conflict {
+        +tuple~Task~ tasks
+        +str message
+    }
+
+    class _Day {
+        <<NamedTuple>>
+        +datetime start
+        +datetime end
+        +date date
+    }
+
+    class schedule_helpers {
+        <<module functions>>
+        sort_by_time(tasks) list~Task~
+        _free_gaps(blocked, day) Iterator
+        _is_free(start, end, busy) bool
     }
 
     Owner "1" o-- "*" Pet : has
@@ -96,7 +130,14 @@ classDiagram
     Task --> Priority
     Task --> Category
     Task --> Frequency
-    Scheduler --> Owner : reads constraints from
+    Task ..> Task : mark_complete creates next occurrence
+    Scheduler --> Owner : reads tasks and day window from
     Scheduler ..> DailyPlan : creates
+    Scheduler ..> Conflict : creates
+    Scheduler ..> _Day : uses
+    Scheduler ..> schedule_helpers : uses
     DailyPlan "1" *-- "*" ScheduledTask : contains
+    DailyPlan "1" *-- "*" SkippedTask : contains
     ScheduledTask --> Task : wraps
+    SkippedTask --> Task : wraps
+    Conflict "1" --> "1..*" Task : reports

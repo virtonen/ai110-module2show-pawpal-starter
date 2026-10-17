@@ -24,7 +24,7 @@ Your final app should:
 
 ## Implementation summary
 
-The core logic lives in [pawpal_system.py](pawpal_system.py) and follows the diagram in [diagrams/uml.mmd](diagrams/uml.mmd). It runs from the terminal with `python main.py`.
+The core logic lives in [pawpal_system.py](pawpal_system.py) and follows the diagram in [diagrams/uml_final.mmd](diagrams/uml_final.mmd). It runs from the terminal with `python main.py`.
 
 How the classes work together:
 
@@ -38,6 +38,45 @@ The approach is greedy, so it is simple and easy to explain, but not optimal: a 
 
 Tests for the core classes and the scheduling features below are in [tests/test_pawpal.py](tests/test_pawpal.py).
 
+## ✨ Features
+
+**Planning**
+
+- **Priority-based daily plan.** Tasks from all of an owner's pets are planned together inside the owner's day window. Order: fixed tasks first, then high to low priority, then earlier preferred time, then shorter duration, then title, so the same input always gives the same plan.
+- **Preferred times with nearest-slot fallback.** A task goes at its preferred time when that time is free. If not, it goes to the free slot nearest to the preferred time, before or after. A task with no preferred time takes the earliest free slot.
+- **Fixed tasks.** A task marked fixed (such as medication) is placed first at its exact time and is never moved. If two fixed tasks overlap, or one falls outside the day, the later one is skipped and reported.
+- **Soft holds.** A task with no preferred time avoids the preferred windows of tasks not yet placed, when it can, so it does not block them.
+- **Skipped tasks with reasons.** A task that does not fit is listed with why, not dropped silently.
+- **Plain-English explanations.** Every scheduled task says why it is where it is: placed at its preferred time, or the preferred time was unavailable.
+- **No overlaps, inside the day.** A plan never double-books the owner and never goes outside the owner's available window. A randomized test checks this over 200 plans.
+
+**Organizing tasks**
+
+- **Sorting by time.** Tasks are ordered by preferred time, untimed last, with ties broken by priority and then title.
+- **Filtering.** Filter by pet name (case-insensitive) and by status: pending, overdue or completed. Filtering and sorting can be combined.
+- **Due-date awareness.** Only tasks that are not completed and due on or before the plan date are planned. Overdue tasks are included. Tasks due in the future are left out.
+
+**Warnings**
+
+- **Conflict warnings.** The scheduler flags tasks whose preferred times overlap, including two tasks at exactly the same time, and including tasks for different pets, because the owner is one person. It also flags a task whose preferred window falls outside the owner's day. Tasks that only touch (one ends at 10:00, the next starts at 10:00) are not conflicts. In the app, each warning says which task keeps its time and which one moves.
+
+**Recurring tasks**
+
+- **Daily and weekly recurrence.** Completing a daily or weekly task creates the next copy, due 1 or 7 days later. If the task was overdue, the date counts from the completion date, so it does not stay overdue. If it was completed early, the original schedule is kept. Completing a task twice never creates a duplicate, and a one-time task creates none.
+
+**Data safety**
+
+- **Validation.** Empty titles, non-positive durations, and a fixed task with no preferred time are rejected. Duplicate task or pet ids are rejected, and looking up a missing id raises an error.
+- **Safe edits.** `Task.update` changes several fields at once. If any value is invalid, every field is rolled back. `id` and `pet_id` cannot be changed.
+
+**App (Streamlit)**
+
+- Add pets and tasks (duration, priority, category, repeat, preferred time, fixed) and set the owner's day window.
+- A sorted, filterable task table with a "done" button for each pending task.
+- Conflict warnings when a task is added and above the schedule button, then a schedule table with the reasons and a list of skipped tasks.
+
+Details of the algorithms are in [Smarter Scheduling](#-smarter-scheduling) below.
+
 ## Getting started
 
 ### Setup
@@ -46,6 +85,13 @@ Tests for the core classes and the scheduling features below are in [tests/test_
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+```
+
+### Run the app
+
+```bash
+streamlit run app.py   # the web app
+python main.py         # a terminal demo with sample pets and tasks
 ```
 
 ### Suggested workflow
@@ -145,12 +191,113 @@ All 73 tests pass, and they cover the core behaviors where a bug would hurt the 
 
 ## 📸 Demo Walkthrough
 
-Describe your app in numbered steps so a reader can follow along without watching a video:
+### The app at a glance
 
-1. <!-- Describe this step -->
-2. <!-- Describe this step -->
-3. <!-- Describe this step -->
-4. <!-- Describe this step -->
-5. <!-- Add more steps as needed -->
+Start it with `streamlit run app.py`. This is the app on first launch, with one pet added and no tasks yet:
 
-**Screenshot or video** *(optional)*: <!-- Insert a screenshot or link to a demo video here -->
+![PawPal+ Streamlit app on first launch](diagrams/pawpal_plus_streamlit.png)
+
+The page has three parts, top to bottom:
+
+1. **Owner and Pets.** Enter the owner's name and the hours they are available (**Day starts** / **Day ends**). Type a pet name, pick a species and press **Add pet**. You can add as many pets as you like. If the end time is not after the start time, the app shows an error and keeps the previous hours.
+2. **Add a task and Your tasks.**
+   - Choose a pet, then set the title, duration, priority, category, how often it **Repeats** (once, daily, weekly) and, optionally, a **preferred time**. Tick **Fixed time** for things that must not move, such as medication. Press **Add task**.
+   - The task table can be filtered by pet and by status (all, pending, overdue, completed). It is always sorted by preferred time, with tasks that have no time last.
+   - Each pending task has a **✓ done** button. Completing a daily or weekly task shows when the next one is due.
+3. **Build Schedule.** Time conflicts are listed first. **Generate schedule** then builds today's plan: a table of start and end times, the pet, the priority, and a **why** column, followed by any tasks that did not fit.
+
+### Example workflow
+
+1. **Add a pet.** Leave the owner at 08:00-20:00, type "Mochi", choose "dog" and press **Add pet**.
+2. **Add a first task.** Title "Morning walk", 20 minutes, priority high, **Repeats** daily, tick **Set a preferred time** and leave it at 09:00. Press **Add task**. A green message confirms it.
+3. **Add a clashing task.** Title "Feed", 20 minutes, priority low, preferred time 09:00. When you press **Add task**, a warning appears at once: *"Both want 09:00: **Morning walk** (Mochi) keeps 09:00; **Feed** (Mochi) moves to 08:40."*
+4. **Check your tasks.** Under **Your tasks**, both tasks show at 09:00, sorted by time. Use **Show status** to switch between pending and completed.
+5. **Build the plan.** Under **Build Schedule**, a yellow banner says "1 time clash found. Nothing is lost…" and repeats the line from step 3. Press **Generate schedule**. The table shows Feed at 08:40-09:00 and Morning walk at 09:00-09:20, each with a reason such as "preferred time 09:00 was unavailable" or "placed at its preferred time".
+6. **Mark it done.** Press **✓ Morning walk (Mochi)**. The app says the next walk is due tomorrow. The task table now shows today's walk as done and a new copy as due tomorrow. The clash is gone from the warnings, because the completed walk is no longer due today.
+
+### Scheduler behaviors on show
+
+| Behavior | Where you see it |
+|----------|------------------|
+| **Sorting by time** | The task table and the "Sorted by time" lists in the terminal output below. Untimed tasks are last, and ties go to the higher priority. |
+| **Filtering** | The pet and status selectors in the app. In the terminal output: "Mia's tasks, sorted" and "Rex, pending today, sorted". |
+| **Conflict warnings** | A warning when a task is added, a banner above **Generate schedule**, and the "Conflict check" lines below. Conflicts across different pets are caught too (Mia's laser play against Rex's training). |
+| **Priority wins a clash** | Medication (high) keeps 09:30. Laser pointer play (medium) is moved to 10:00, the nearest free slot. |
+| **Recurring tasks** | Completing Breakfast creates the next one, due tomorrow. It no longer appears in today's pending list. |
+| **Skipped tasks with a reason** | "Clean litter box" needs 180 minutes, and no slot that long is left in the 4-hour day. |
+| **Explanations** | Every scheduled task has a plain-English reason under it. |
+
+### Sample terminal output
+
+Output of `python main.py` (the dates are the day it is run). It builds one owner with two pets and seven tasks added out of order, then sorts, filters, completes a recurring task, checks for conflicts and prints the plan:
+
+```
+
+All tasks, as added:
+  08:30  Morning walk         high   todo
+  11:00  Brush coat           low    todo
+  09:40  Training             medium todo
+  08:00  Breakfast            high   todo
+  09:30  Medication           high   todo
+  09:30  Laser pointer play   medium todo
+  --:--  Clean litter box     low    todo
+
+Sorted by time:
+  08:00  Breakfast            high   todo
+  08:30  Morning walk         high   todo
+  09:30  Medication           high   todo
+  09:30  Laser pointer play   medium todo
+  09:40  Training             medium todo
+  11:00  Brush coat           low    todo
+  --:--  Clean litter box     low    todo
+
+Mia's tasks, sorted:
+  08:00  Breakfast            high   todo
+  09:30  Medication           high   todo
+  09:30  Laser pointer play   medium todo
+  --:--  Clean litter box     low    todo
+
+Completed Breakfast; next one is due 2026-10-18
+
+Completed:
+  08:00  Breakfast            high   done
+
+Pending today, sorted:
+  08:30  Morning walk         high   todo
+  09:30  Medication           high   todo
+  09:30  Laser pointer play   medium todo
+  09:40  Training             medium todo
+  11:00  Brush coat           low    todo
+  --:--  Clean litter box     low    todo
+
+Rex, pending today, sorted:
+  08:30  Morning walk         high   todo
+  09:40  Training             medium todo
+  11:00  Brush coat           low    todo
+
+Conflict check:
+  WARNING: Medication (Mia) and Laser pointer play (Mia) overlap at 09:30
+  WARNING: Laser pointer play (Mia) and Training (Rex) overlap at 09:40
+Today's Schedule for Sam (Saturday, October 17)
+Available: 08:00-12:00 (240 min), scheduled: 120 min
+------------------------------------------------------------
+08:30-09:15  Morning walk         Rex   [high]
+             high priority; placed at its preferred time
+09:30-09:35  Medication           Mia   [high]
+             high priority; placed at its preferred time
+09:40-10:00  Training             Rex   [medium]
+             medium priority; placed at its preferred time
+10:00-10:30  Laser pointer play   Mia   [medium]
+             medium priority; preferred time 09:30 was unavailable
+11:00-11:20  Brush coat           Rex   [low]
+             low priority; placed at its preferred time
+
+Skipped:
+  Clean litter box: low priority, but no free 180-minute slot left between 08:00 and 12:00
+```
+
+### Class diagram
+
+The class diagram below shows how the classes fit together (the source is [diagrams/uml_final.mmd](diagrams/uml_final.mmd)).
+
+![PawPal+ class diagram](diagrams/mermaid-diagram-2026-10-17-162137.png)
