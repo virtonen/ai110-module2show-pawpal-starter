@@ -83,19 +83,45 @@ Skipped:
 
 ## 🧪 Testing PawPal+
 
-```bash
-# Run the full test suite:
-pytest
+Run the full suite from the project root:
 
-# Run with coverage:
-pytest --cov
+```bash
+pytest
 ```
+
+**What the 73 tests in [tests/test_pawpal.py](tests/test_pawpal.py) cover:**
+
+- **Sorting:** chronological order, untimed tasks last, deterministic tie-breaking by priority then title.
+- **Recurrence:** completing a daily or weekly task creates one new copy due the next day or week. This includes overdue and early completion, leap days and year ends. `ONCE` tasks create none.
+- **Conflict detection:** overlapping windows, two tasks at the exact same time, conflicts across pets, windows outside the owner's day. Untimed, completed and not-yet-due tasks are ignored.
+- **Plan generation:** only due tasks are planned, priority wins a clash, the loser goes to the nearest free slot, and fixed tasks never move. Tasks that do not fit are skipped with a reason. A randomized test checks 200 plans for overlaps and day-window violations.
+- **Edge cases:** a pet with no tasks, an owner with no pets, tasks ending exactly at the end of the day, a day window too small for any task, and the greedy limit where one long task crowds out short ones.
+- **Bad input:** empty titles, non-positive durations, duplicate or missing ids, and `Task.update` rolling back on invalid or protected fields.
 
 Sample test output:
 
 ```
-# Paste your pytest output here
+================================================================== test session starts ==================================================================
+platform darwin -- Python 3.14.6, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/vvirtonen/GitHub/ai110/ai110-module2show-pawpal-starter
+configfile: pytest.ini
+testpaths: tests
+plugins: anyio-4.12.1
+collected 73 items                                                                                                                                      
+
+tests/test_pawpal.py .........................................................................                                                    [100%]
+
+================================================================== 73 passed in 0.07s ===================================================================
 ```
+
+**Confidence level: ⭐⭐⭐⭐ (4 / 5)**
+
+All 73 tests pass, and they cover the core behaviors where a bug would hurt the owner most: no overlapping plans, correct recurrence dates, and rejected bad input. I trust the scheduling logic and the data model. I stop at 4/5 because:
+
+- The scheduler is greedy, so it is not optimal. One long high-priority task can crowd out several short ones (a test documents this).
+- Tests cover `pawpal_system.py` only. The Streamlit UI in `app.py` has no automated tests.
+- Times are plain local times, with no time zones, daylight saving or tasks that run past midnight.
+- Coverage has not been measured.
 
 ## 📐 Smarter Scheduling
 

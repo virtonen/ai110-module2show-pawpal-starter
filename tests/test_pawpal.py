@@ -290,3 +290,418 @@ def test_random_plans_never_overlap_and_stay_inside_the_day():
         assert all(a.end <= b.start for a, b in zip(items, items[1:]))
         assert all(dt(8) <= i.start and i.end <= dt(14) for i in items)
         assert len(items) + len(plan.skipped) == len(pet.tasks)
+
+
+# ---- edge cases: due filtering, empty states, boundaries ---------------------------
+
+from dataclasses import replace as _replace
+
+
+def titles(plan):
+    return {i.task.title for i in plan.scheduled}
+
+
+def test_plan_includes_only_due_tasks():
+    owner, pet = make()
+    done = t("Done")
+    done.completed = True
+    pet.add_task(done)
+    pet.add_task(t("Future", due_date=DAY + timedelta(days=1)))
+    pet.add_task(t("Overdue", due_date=DAY - timedelta(days=2)))
+    pet.add_task(t("Today", due_date=DAY))
+    pet.add_task(t("Whenever"))  # no due_date = due until completed
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert titles(plan) == {"Overdue", "Today", "Whenever"}
+    assert plan.skipped == []  # excluded tasks are not "skipped", just not due
+
+
+def test_pet_without_tasks_gives_empty_plan():
+    owner, _ = make()
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert plan.scheduled == [] and plan.skipped == []
+    assert plan.total_minutes() == 0
+    assert Scheduler(owner).find_conflicts(plan_date=DAY) == []
+    assert "0 min" in plan.summary()
+
+
+def test_owner_without_pets_gives_empty_plan():
+    plan = Scheduler(Owner(name="Solo")).generate_plan(DAY)
+    assert plan.scheduled == [] and plan.skipped == []
+
+
+def test_all_tasks_completed_gives_empty_plan():
+    owner, pet = make()
+    for n in range(3):
+        task = t(f"t{n}")
+        task.completed = True
+        pet.add_task(task)
+    assert Scheduler(owner).generate_plan(DAY).scheduled == []
+
+
+def test_task_ending_exactly_at_day_end_is_scheduled():
+    owner, pet = make(owner_end=time(9, 0))
+    pet.add_task(t("Fits", 60))
+    pet.add_task(t("Timed", 30, at=time(8, 30)))  # also ends exactly at 09:00
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert starts(plan)["Timed"] == time(8, 30)
+    assert titles(plan) == {"Timed"}  # Fits no longer fits next to it
+    assert [s.task.title for s in plan.skipped] == ["Fits"]
+
+
+def test_task_exactly_filling_the_day_is_scheduled():
+    owner, pet = make(owner_end=time(9, 0))
+    pet.add_task(t("Whole", 60))
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert starts(plan) == {"Whole": time(8, 0)}
+
+
+def test_task_one_minute_too_long_is_skipped():
+    owner, pet = make(owner_end=time(9, 0))
+    pet.add_task(t("Whole", 61))
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert plan.scheduled == [] and len(plan.skipped) == 1
+
+
+def test_day_window_too_small_for_any_task_skips_everything():
+    owner, pet = make(owner_end=time(8, 20))
+    pet.add_task(t("A", 30, Priority.HIGH))
+    pet.add_task(t("B", 45, at=time(8, 0)))
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert plan.scheduled == []
+    assert len(plan.skipped) == 2
+
+
+def test_zero_length_or_inverted_day_window_skips_everything():
+    for end in (time(8, 0), time(7, 0)):
+        owner, pet = make(owner_end=end)
+        pet.add_task(t("A", 10))
+        plan = Scheduler(owner).generate_plan(DAY)
+        assert owner.available_minutes == 0
+        assert plan.scheduled == [] and len(plan.skipped) == 1
+
+
+def test_fixed_task_outside_day_window_is_skipped_not_moved():
+    owner, pet = make()
+    pet.add_task(t("Night meds", 10, at=time(21, 0), fixed=True))
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert plan.scheduled == [] and len(plan.skipped) == 1
+
+
+def test_greedy_high_priority_task_can_crowd_out_several_short_ones():
+    # Known limit of the greedy strategy (see Scheduler docstring): skipping the
+    # big task would fit both small ones, but priority order places it first.
+    owner, pet = make()  # 08:00-20:00 = 720 min
+    pet.add_task(t("Big", 700, Priority.HIGH))
+    pet.add_task(t("Small1", 30, Priority.MEDIUM))
+    pet.add_task(t("Small2", 30, Priority.MEDIUM))
+    plan = Scheduler(owner).generate_plan(DAY)
+    assert titles(plan) == {"Big"}
+    assert {s.task.title for s in plan.skipped} == {"Small1", "Small2"}
+
+
+# ---- edge cases: ties and determinism -------------------------------------------------
+
+
+def test_same_time_same_priority_is_deterministic_regardless_of_insertion_order():
+    results = []
+    for order in (["A", "B", "C"], ["C", "B", "A"], ["B", "C", "A"]):
+        owner, pet = make()
+        for name in order:
+            pet.add_task(t(name, 30, Priority.MEDIUM, time(9, 0)))
+        results.append(starts(Scheduler(owner).generate_plan(DAY)))
+    assert results[0] == results[1] == results[2]
+    assert results[0]["A"] == time(9, 0)  # title breaks the tie
+    assert len(set(results[0].values())) == 3  # no two share a start
+
+
+def test_sort_by_time_exact_ties_are_ordered_by_priority_then_title():
+    a = t("b", at=time(9, 0), prio=Priority.MEDIUM)
+    b = t("a", at=time(9, 0), prio=Priority.MEDIUM)
+    c = t("z", at=time(9, 0), prio=Priority.HIGH)
+    assert [x.title for x in sort_by_time([a, b, c])] == ["z", "a", "b"]
+    assert [x.title for x in sort_by_time([c, b, a])] == ["z", "a", "b"]
+
+
+def test_sort_by_time_empty_list_and_does_not_mutate_input():
+    assert sort_by_time([]) == []
+    items = [t("late", at=time(15, 0)), t("early", at=time(7, 0))]
+    sort_by_time(items)
+    assert [x.title for x in items] == ["late", "early"]
+
+
+def test_generate_plan_twice_gives_same_result_and_does_not_mutate_tasks():
+    owner, pet = make()
+    pet.add_task(t("A", 30, Priority.HIGH, time(9, 0)))
+    pet.add_task(t("B", 30, Priority.LOW, time(9, 0)))
+    pet.add_task(t("C", 20, Priority.MEDIUM, due_date=DAY - timedelta(days=1)))
+    before = [_replace(x) for x in pet.tasks]
+    sched = Scheduler(owner)
+    first, second = sched.generate_plan(DAY), sched.generate_plan(DAY)
+    assert starts(first) == starts(second)
+    assert pet.tasks == before
+
+
+# ---- edge cases: recurrence ---------------------------------------------------------------
+
+
+def test_recurring_task_without_due_date_reappears_on_the_next_day_only():
+    owner, pet = make()
+    task = t("Feed", frequency=Frequency.DAILY)  # due_date=None
+    pet.add_task(task)
+    pet.complete_task(task.id, on=DAY)
+    sched = Scheduler(owner)
+    assert titles(sched.generate_plan(DAY)) == set()  # done today, next not due yet
+    assert titles(sched.generate_plan(DAY + timedelta(days=1))) == {"Feed"}
+    assert titles(sched.generate_plan(DAY + timedelta(days=5))) == {"Feed"}  # stays due
+
+
+def test_uncompleted_recurring_task_without_due_date_is_in_every_plan():
+    owner, pet = make()
+    pet.add_task(t("Feed", frequency=Frequency.DAILY))
+    sched = Scheduler(owner)
+    for offset in range(3):
+        assert titles(sched.generate_plan(DAY + timedelta(days=offset))) == {"Feed"}
+
+
+def test_daily_recurrence_across_leap_day_and_year_end():
+    leap = t("Feed", frequency=Frequency.DAILY, due_date=date(2028, 2, 28))
+    assert leap.mark_complete(on=date(2028, 2, 28)).due_date == date(2028, 2, 29)
+    nonleap = t("Feed", frequency=Frequency.DAILY, due_date=date(2027, 2, 28))
+    assert nonleap.mark_complete(on=date(2027, 2, 28)).due_date == date(2027, 3, 1)
+    newyear = t("Feed", frequency=Frequency.DAILY, due_date=date(2026, 12, 31))
+    assert newyear.mark_complete(on=date(2026, 12, 31)).due_date == date(2027, 1, 1)
+    weekly = t("Groom", frequency=Frequency.WEEKLY, due_date=date(2026, 12, 28))
+    assert weekly.mark_complete(on=date(2026, 12, 28)).due_date == date(2027, 1, 4)
+
+
+def test_overdue_weekly_task_counts_from_completion_date():
+    task = t("Groom", frequency=Frequency.WEEKLY, due_date=DAY - timedelta(days=10))
+    assert task.mark_complete(on=DAY).due_date == DAY + timedelta(days=7)
+
+
+def test_early_completion_keeps_the_schedule_not_the_completion_date():
+    task = t("Feed", frequency=Frequency.DAILY, due_date=DAY + timedelta(days=3))
+    assert task.mark_complete(on=DAY).due_date == DAY + timedelta(days=4)
+
+
+def test_next_occurrence_is_a_fresh_copy_with_the_same_details():
+    _, pet = make()
+    task = t("Meds", 5, Priority.HIGH, time(9, 0), frequency=Frequency.DAILY,
+             due_date=DAY, fixed=True)
+    pet.add_task(task)
+    nxt = pet.complete_task(task.id, on=DAY)
+    assert nxt is not task and nxt.id != task.id
+    assert nxt.pet_id == pet.id and nxt in pet.tasks
+    assert nxt.completed is False and task.completed is True
+    assert (nxt.title, nxt.duration_minutes, nxt.priority, nxt.preferred_time,
+            nxt.frequency, nxt.fixed) == (task.title, 5, Priority.HIGH, time(9, 0),
+                                          Frequency.DAILY, True)
+
+
+def test_completing_recurring_task_keeps_exactly_one_pending_copy():
+    _, pet = make()
+    task = t("Feed", frequency=Frequency.DAILY, due_date=DAY)
+    pet.add_task(task)
+    day = DAY
+    for _ in range(5):
+        current = next(x for x in pet.tasks if not x.completed)
+        pet.complete_task(current.id, on=day)
+        day += timedelta(days=1)
+        assert len([x for x in pet.tasks if not x.completed]) == 1
+    assert len(pet.tasks) == 6
+
+
+# ---- edge cases: bad input is rejected and leaves data unchanged -------------------------
+
+
+@pytest.mark.parametrize("title", ["", "   ", "\n\t"])
+def test_empty_title_is_rejected(title):
+    with pytest.raises(ValueError):
+        Task(title, Category.OTHER, 10, Priority.LOW)
+
+
+@pytest.mark.parametrize("minutes", [0, -1, -60])
+def test_non_positive_duration_is_rejected(minutes):
+    with pytest.raises(ValueError):
+        Task("x", Category.OTHER, minutes, Priority.LOW)
+
+
+def test_update_applies_valid_changes():
+    task = t("Walk", 30)
+    task.update({"title": "Long walk", "duration_minutes": 60, "priority": Priority.HIGH})
+    assert (task.title, task.duration_minutes, task.priority) == (
+        "Long walk", 60, Priority.HIGH)
+
+
+def test_update_rolls_back_every_field_when_one_is_invalid():
+    task = t("Walk", 30, Priority.LOW)
+    with pytest.raises(ValueError):
+        task.update({"title": "New", "priority": Priority.HIGH, "duration_minutes": 0})
+    assert (task.title, task.priority, task.duration_minutes) == ("Walk", Priority.LOW, 30)
+
+
+def test_update_rolls_back_when_fixed_has_no_preferred_time():
+    task = t("Walk")
+    with pytest.raises(ValueError):
+        task.update({"fixed": True})
+    assert task.fixed is False
+
+
+def test_update_rejects_empty_title_and_keeps_old_one():
+    task = t("Walk")
+    with pytest.raises(ValueError):
+        task.update({"title": "  "})
+    assert task.title == "Walk"
+
+
+@pytest.mark.parametrize("changes", [{"id": "new"}, {"pet_id": "new"}, {"nope": 1}])
+def test_update_refuses_protected_and_unknown_fields_without_partial_changes(changes):
+    task = t("Walk")
+    original_id, original_pet = task.id, task.pet_id
+    with pytest.raises(ValueError):
+        task.update({"title": "Changed", **changes})
+    assert task.title == "Walk"  # the valid part was not applied either
+    assert (task.id, task.pet_id) == (original_id, original_pet)
+
+
+def test_add_task_rejects_duplicate_id_and_leaves_pet_unchanged():
+    _, pet = make()
+    task = t("A")
+    pet.add_task(task)
+    clone = _replace(t("B"), id=task.id)
+    with pytest.raises(ValueError):
+        pet.add_task(clone)
+    assert pet.tasks == [task]
+    assert clone.pet_id == ""  # not claimed by the pet
+
+
+def test_add_task_sets_pet_id():
+    _, pet = make()
+    task = t("A")
+    pet.add_task(task)
+    assert task.pet_id == pet.id
+
+
+def test_remove_task_removes_only_that_task_and_missing_id_raises():
+    _, pet = make()
+    a, b = t("A"), t("B")
+    pet.add_task(a)
+    pet.add_task(b)
+    pet.remove_task(a.id)
+    assert pet.tasks == [b]
+    with pytest.raises(KeyError):
+        pet.remove_task(a.id)  # already gone
+    assert pet.tasks == [b]
+
+
+def test_complete_task_with_missing_id_raises_and_changes_nothing():
+    _, pet = make()
+    task = t("A", frequency=Frequency.DAILY)
+    pet.add_task(task)
+    with pytest.raises(KeyError):
+        pet.complete_task("no-such-id", on=DAY)
+    assert task.completed is False and len(pet.tasks) == 1
+
+
+def test_complete_task_cannot_complete_another_pets_task():
+    owner, rex = make()
+    mia = Pet(name="Mia", species="cat")
+    owner.add_pet(mia)
+    task = t("Walk")
+    rex.add_task(task)
+    with pytest.raises(KeyError):
+        mia.complete_task(task.id, on=DAY)
+    assert task.completed is False
+
+
+def test_owner_rejects_duplicate_pet_and_missing_pet_removal():
+    owner, pet = make()
+    with pytest.raises(ValueError):
+        owner.add_pet(pet)
+    assert owner.pets == [pet]
+    with pytest.raises(KeyError):
+        owner.remove_pet("no-such-id")
+
+
+# ---- happy path: end to end ---------------------------------------------------------------
+
+
+def test_end_to_end_two_pets_complete_and_replan():
+    owner, rex = make()
+    mia = Pet(name="Mia", species="cat")
+    owner.add_pet(mia)
+    walk = t("Walk", 30, Priority.HIGH, time(9, 0), frequency=Frequency.DAILY, due_date=DAY)
+    feed = t("Feed", 10, Priority.HIGH, time(9, 0), frequency=Frequency.DAILY, due_date=DAY)
+    vet = t("Vet", 60, Priority.MEDIUM, time(14, 0), due_date=DAY)
+    rex.add_task(walk)
+    mia.add_task(feed)
+    rex.add_task(vet)
+    sched = Scheduler(owner)
+
+    plan = sched.generate_plan(DAY)
+    assert titles(plan) == {"Walk", "Feed", "Vet"}
+    assert [i.start for i in plan.scheduled] == sorted(i.start for i in plan.scheduled)
+    assert len(sched.find_conflicts(plan_date=DAY)) == 1  # Walk and Feed overlap
+    assert {i.pet_name for i in plan.scheduled} == {"Rex", "Mia"}
+
+    rex.complete_task(walk.id, on=DAY)
+    assert titles(sched.generate_plan(DAY)) == {"Feed", "Vet"}
+    tomorrow = sched.generate_plan(DAY + timedelta(days=1))
+    assert titles(tomorrow) == {"Walk", "Feed", "Vet"}  # Feed/Vet still pending
+    assert [x.title for x in owner.filter_tasks("Rex", "completed")] == ["Walk"]
+
+
+# ---- conflict detection: exact duplicate times ---------------------------------------------
+
+
+def test_find_conflicts_flags_two_tasks_at_the_exact_same_time():
+    owner, pet = make()
+    pet.add_task(t("Walk", 30, at=time(9, 0)))
+    pet.add_task(t("Feed", 30, at=time(9, 0)))
+    conflicts = Scheduler(owner).find_conflicts(plan_date=DAY)
+    assert len(conflicts) == 1
+    assert {x.title for x in conflicts[0].tasks} == {"Walk", "Feed"}
+    assert "09:00" in conflicts[0].message
+
+
+def test_find_conflicts_flags_same_time_across_different_pets():
+    owner, rex = make()
+    mia = Pet(name="Mia", species="cat")
+    owner.add_pet(mia)
+    rex.add_task(t("Walk", 20, at=time(9, 0)))
+    mia.add_task(t("Meds", 5, at=time(9, 0)))
+    conflicts = Scheduler(owner).find_conflicts(plan_date=DAY)
+    assert len(conflicts) == 1
+    assert "Rex" in conflicts[0].message and "Mia" in conflicts[0].message
+
+
+def test_find_conflicts_three_tasks_at_one_time_gives_two_reports():
+    owner, pet = make()
+    for name in ("A", "B", "C"):
+        pet.add_task(t(name, 30, at=time(9, 0)))
+    assert len(Scheduler(owner).find_conflicts(plan_date=DAY)) == 2
+
+
+def test_find_conflicts_ignores_untimed_completed_and_not_yet_due_tasks():
+    owner, pet = make()
+    done = t("Done", 30, at=time(9, 0))
+    done.completed = True
+    pet.add_task(done)
+    pet.add_task(t("Future", 30, at=time(9, 0), due_date=DAY + timedelta(days=1)))
+    pet.add_task(t("Untimed1", 30))
+    pet.add_task(t("Untimed2", 30))
+    pet.add_task(t("Real", 30, at=time(9, 0)))
+    assert Scheduler(owner).find_conflicts(plan_date=DAY) == []
+
+
+def test_duplicate_times_are_flagged_and_the_plan_still_has_no_overlap():
+    owner, pet = make()
+    pet.add_task(t("Walk", 30, Priority.HIGH, time(9, 0)))
+    pet.add_task(t("Feed", 30, Priority.LOW, time(9, 0)))
+    sched = Scheduler(owner)
+    assert len(sched.find_conflicts(plan_date=DAY)) == 1
+    plan = sched.generate_plan(DAY)
+    assert starts(plan)["Walk"] == time(9, 0)  # higher priority keeps the time
+    assert starts(plan)["Feed"] != time(9, 0)  # the other was moved, not dropped
+    a, b = sorted(plan.scheduled, key=lambda i: i.start)
+    assert a.end <= b.start
