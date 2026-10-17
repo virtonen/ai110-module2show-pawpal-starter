@@ -22,6 +22,22 @@ Your final app should:
 - Display the plan clearly (and ideally explain the reasoning)
 - Include tests for the most important scheduling behaviors
 
+## Implementation summary
+
+The core logic lives in [pawpal_system.py](pawpal_system.py) and follows the diagram in [diagrams/uml.mmd](diagrams/uml.mmd). It runs from the terminal with `python main.py`.
+
+How the classes work together:
+
+- An **Owner** has one or more **Pets** and a daily availability window (for example 08:00 to 12:00).
+- Each **Pet** keeps its own list of **Tasks**: a walk, a feeding, a medication. A task has a duration, a priority, an optional preferred time, and can repeat daily or weekly.
+- The **Scheduler** takes an owner and asks it for every pet's due tasks in one call (`owner.get_all_tasks`), so it plans for the whole household.
+- It sorts those tasks by priority, then tries to give each one its preferred time, falling back to the earliest free slot in the owner's window. Tasks that don't fit are skipped.
+- The result is a **DailyPlan**: the scheduled tasks (each with a start and end time and a plain-English reason) and the skipped tasks with the reason they were left out.
+
+The approach is greedy, so it is simple and easy to explain, but not optimal: a long high-priority task can use up time that several short ones needed.
+
+Two basic tests (marking a task complete, adding a task to a pet) are in [tests/test_pawpal.py](tests/test_pawpal.py).
+
 ## Getting started
 
 ### Setup
