@@ -46,6 +46,8 @@ Yes. The design changed after I reviewed the class skeleton. Changes:
 - Describe one tradeoff your scheduler makes.
 - Why is that tradeoff reasonable for this scenario?
 
+The scheduler is greedy by priority: it places tasks one at a time, highest priority first, and never rearranges. When two tasks want overlapping times, the higher-priority one keeps its slot and the other moves to the nearest free slot. It checks overlap using start time plus duration. The cost is that the plan is not optimal. One long high-priority task can take the time that would have fit several short ones, and a moved task can end up away from its preferred time (just like in real life). I accepted this because it is fast, deterministic and easy to explain, and every placement comes with a reason. For a few dozen daily pet tasks, a plan the owner can follow at a glance matters more than the last few saved minutes. `find_conflicts` makes up for the lost preferences by warning the owner which tasks were moved. Tasks marked `fixed` are the exception: they are never moved.
+
 ---
 
 ## 3. AI Collaboration

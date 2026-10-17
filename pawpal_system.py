@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from bisect import bisect_left, insort
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from enum import Enum, IntEnum
+from typing import NamedTuple
 from uuid import uuid4
 
 
@@ -55,6 +58,7 @@ class Task:
     frequency: Frequency = Frequency.ONCE
     due_date: date | None = None  # None = due whenever not completed
     completed: bool = False
+    fixed: bool = False  # True = must happen at preferred_time (never moved)
 
     def __post_init__(self) -> None:
         """Validate fields (duration_minutes > 0, etc.)."""
@@ -62,22 +66,35 @@ class Task:
             raise ValueError("title must not be empty")
         if self.duration_minutes <= 0:
             raise ValueError("duration_minutes must be positive")
+        if self.fixed and self.preferred_time is None:
+            raise ValueError("a fixed task needs a preferred_time")
 
     def is_due(self, on: date) -> bool:
         """Return True if the task is not completed and due on or before `on`."""
         return not self.completed and (self.due_date is None or self.due_date <= on)
 
-    def mark_complete(self) -> Task | None:
-        """Mark done; for DAILY/WEEKLY tasks return the next occurrence, else None."""
+    def is_overdue(self, on: date) -> bool:
+        """Return True if the task is not completed and was due before `on`."""
+        return not self.completed and self.due_date is not None and self.due_date < on
+
+    def mark_complete(self, on: date | None = None) -> Task | None:
+        """Mark done on `on` (default: today); for DAILY/WEEKLY tasks return the
+        next occurrence, else None. Completing an already-completed task is a
+        no-op, so it cannot spawn duplicate occurrences. The next due date counts
+        from the later of the old due date and `on`, so an overdue recurring task
+        does not stay overdue after being completed."""
+        if self.completed:
+            return None
         self.completed = True
         if self.frequency is Frequency.ONCE:
             return None
+        on = on or date.today()
         step = timedelta(days=1 if self.frequency is Frequency.DAILY else 7)
         return replace(
             self,
             id=_new_id(),
             completed=False,
-            due_date=(self.due_date or date.today()) + step,
+            due_date=max(self.due_date or on, on) + step,
         )
 
     def update(self, changes: dict) -> None:
@@ -123,12 +140,12 @@ class Pet:
                 return
         raise KeyError(f"no task with id {task_id}")
 
-    def complete_task(self, task_id: str) -> Task | None:
+    def complete_task(self, task_id: str, on: date | None = None) -> Task | None:
         """Mark a task complete and add its next occurrence if it recurs."""
         task = next((t for t in self.tasks if t.id == task_id), None)
         if task is None:
             raise KeyError(f"no task with id {task_id}")
-        next_task = task.mark_complete()
+        next_task = task.mark_complete(on)
         if next_task is not None:
             self.add_task(next_task)
         return next_task
@@ -183,6 +200,48 @@ class Owner:
             tasks.extend(pet.get_pending_tasks(on) if pending_only else pet.tasks)
         return tasks
 
+    def filter_tasks(
+        self,
+        pet_name: str | None = None,
+        status: str | None = None,
+        on: date | None = None,
+    ) -> list[Task]:
+        """Return tasks filtered by pet name (case-insensitive) and/or status.
+
+        status is "pending" (not completed and due on `on`), "completed", or
+        "overdue" (not completed, due before `on`). None means no filter."""
+        if status not in (None, "pending", "completed", "overdue"):
+            raise ValueError(f"unknown status: {status}")
+        on = on or date.today()
+        wanted = pet_name.strip().lower() if pet_name else None
+        checks = {
+            None: lambda t: True,
+            "pending": lambda t: t.is_due(on),
+            "completed": lambda t: t.completed,
+            "overdue": lambda t: t.is_overdue(on),
+        }
+        return [
+            task
+            for pet in self.pets
+            if wanted is None or pet.name.lower() == wanted
+            for task in pet.tasks
+            if checks[status](task)
+        ]
+
+
+def sort_by_time(tasks: list[Task]) -> list[Task]:
+    """Order tasks by preferred_time (tasks without one last), then priority
+    (high first), then title so the order is deterministic."""
+    return sorted(
+        tasks,
+        key=lambda t: (
+            t.preferred_time is None,
+            t.preferred_time or time.min,
+            -int(t.priority),
+            t.title,
+        ),
+    )
+
 
 @dataclass
 class ScheduledTask:
@@ -200,12 +259,29 @@ class ScheduledTask:
 
 
 @dataclass
+class SkippedTask:
+    """A task that could not be scheduled, with the reason."""
+
+    task: Task
+    reason: str
+
+
+@dataclass
+class Conflict:
+    """A problem with the requested times: tasks that overlap, or a task that
+    does not fit the owner's day window."""
+
+    tasks: tuple[Task, ...]
+    message: str
+
+
+@dataclass
 class DailyPlan:
     """The finished plan: scheduled tasks plus skipped tasks and why."""
 
     plan_date: date
     scheduled: list[ScheduledTask] = field(default_factory=list)
-    skipped: dict[str, str] = field(default_factory=dict)  # task id -> reason
+    skipped: list[SkippedTask] = field(default_factory=list)
 
     def total_minutes(self) -> int:
         """Return total scheduled minutes."""
@@ -221,18 +297,58 @@ class DailyPlan:
             )
         if self.skipped:
             lines.append("Skipped:")
-            lines.extend(f"  {task_id}: {why}" for task_id, why in self.skipped.items())
+            lines.extend(f"  {s.task.title}: {s.reason}" for s in self.skipped)
         return "\n".join(lines)
+
+
+Interval = tuple[datetime, datetime]  # (start, end)
+
+
+class _Day(NamedTuple):
+    """The owner's availability window on one date."""
+
+    start: datetime
+    end: datetime
+
+    @property
+    def date(self) -> date:
+        """Return the calendar date this window falls on."""
+        return self.start.date()
+
+
+def _free_gaps(blocked: list[Interval], day: _Day) -> Iterator[Interval]:
+    """Yield the free (start, end) gaps inside the day; `blocked` must be sorted."""
+    cursor = day.start
+    for start, end in blocked:
+        if cursor >= day.end:
+            return
+        if start > cursor:
+            yield cursor, min(start, day.end)
+        cursor = max(cursor, end)
+    if cursor < day.end:
+        yield cursor, day.end
+
+
+def _is_free(start: datetime, end: datetime, busy: list[Interval]) -> bool:
+    """Return True if [start, end) overlaps nothing in `busy`. `busy` must be
+    sorted and non-overlapping, so binary search finds the only interval that
+    could clash: the last one that starts before `end`."""
+    i = bisect_left(busy, (end, datetime.min))
+    return i == 0 or busy[i - 1][1] <= start
 
 
 class Scheduler:
     """Builds a DailyPlan from an owner's tasks and constraints.
 
-    Strategy: greedy by priority. Tasks are taken in `_sort_tasks` order and each
-    is placed in the earliest free slot (honouring preferred_time when possible)
-    inside the owner's day window. A task that no longer fits is skipped with a
-    reason. Greedy is simple and explainable, but it is not optimal: one long
-    high-priority task can crowd out several short ones.
+    Strategy: greedy by priority. Fixed tasks are placed first at their exact
+    time. The rest are taken in `_sort_tasks` order; each goes at its preferred
+    time if free, otherwise in the free slot nearest to it (earliest free slot
+    if it has no preference). While searching for such a fallback slot, the
+    preferred windows of tasks not yet placed are kept free when possible, so
+    a task without a preference does not block a later task's preferred time.
+    A task that no longer fits is skipped with a reason. Greedy is simple and
+    explainable, but it is not optimal: one long high-priority task can crowd
+    out several short ones.
     """
 
     def __init__(self, owner: Owner) -> None:
@@ -243,16 +359,26 @@ class Scheduler:
         """Build the plan for `plan_date` (default: today) within the owner's window."""
         plan_date = plan_date or date.today()
         plan = DailyPlan(plan_date=plan_date)
-        busy: list[tuple[datetime, datetime]] = []
+        day = _Day(
+            datetime.combine(plan_date, self.owner.day_start),
+            datetime.combine(plan_date, self.owner.day_end),
+        )
+        busy: list[Interval] = []  # kept sorted; placed tasks never overlap
 
         # One call to the Owner gathers every pet's due tasks together.
         tasks = self.owner.get_all_tasks(pending_only=True, on=plan_date)
-        for task in self._sort_tasks(tasks):
-            start = self._find_slot(task, busy, plan_date)
+        ordered = self._sort_tasks(tasks)
+        windows = [
+            self._window(t, plan_date) if t.preferred_time is not None else None
+            for t in ordered
+        ]
+        for i, task in enumerate(ordered):
+            holds = [w for w in windows[i + 1 :] if w is not None]
+            start = self._find_slot(task, busy, holds, day)
             if start is None:
-                plan.skipped[task.id] = self._explain_skipped(task)
+                plan.skipped.append(SkippedTask(task, self._explain_skipped(task)))
                 continue
-            busy.append((start, start + timedelta(minutes=task.duration_minutes)))
+            insort(busy, (start, start + timedelta(minutes=task.duration_minutes)))
             pet = self.owner.get_pet(task.pet_id)
             plan.scheduled.append(
                 ScheduledTask(
@@ -265,12 +391,88 @@ class Scheduler:
         plan.scheduled.sort(key=lambda item: item.start)
         return plan
 
+    def find_conflicts(
+        self, tasks: list[Task] | None = None, plan_date: date | None = None
+    ) -> list[Conflict]:
+        """Report problems with tasks' preferred times (default: all pending tasks).
+
+        Two kinds are reported: a preferred window that is not inside the owner's
+        day, and preferred windows that overlap each other (the owner is one
+        person, so tasks for different pets clash too). Overlaps are found by
+        sorting on start time and comparing each task with the one that ends
+        latest so far: O(n log n). The scheduler still produces a valid plan; this
+        tells the user which preferences it had to move."""
+        plan_date = plan_date or date.today()
+        if tasks is None:
+            tasks = self.owner.get_all_tasks(pending_only=True, on=plan_date)
+        window_start = datetime.combine(plan_date, self.owner.day_start)
+        window_end = datetime.combine(plan_date, self.owner.day_end)
+        conflicts: list[Conflict] = []
+
+        timed = [t for t in tasks if t.preferred_time is not None]
+        for t in timed:
+            start, end = self._window(t, plan_date)
+            if start < window_start or end > window_end:
+                conflicts.append(
+                    Conflict(
+                        (t,),
+                        f"{t.title} ({start:%H:%M}-{end:%H:%M}) is outside "
+                        f"{self.owner.day_start:%H:%M}-{self.owner.day_end:%H:%M}",
+                    )
+                )
+
+        timed.sort(key=lambda t: (t.preferred_time, -int(t.priority), t.title))
+        latest: Task | None = None
+        latest_end: datetime | None = None
+        for t in timed:
+            start, end = self._window(t, plan_date)
+            if latest is not None and start < latest_end:
+                conflicts.append(
+                    Conflict(
+                        (latest, t),
+                        f"{latest.title} ({self._pet_name(latest)}) and {t.title} "
+                        f"({self._pet_name(t)}) overlap at {start:%H:%M}",
+                    )
+                )
+            if latest_end is None or end > latest_end:
+                latest, latest_end = t, end
+        return conflicts
+
+    def sort_by_time(self, tasks: list[Task] | None = None) -> list[Task]:
+        """Return tasks (default: all pending tasks) ordered by preferred time.
+        See the module-level `sort_by_time` for the ordering rules."""
+        if tasks is None:
+            tasks = self.owner.get_all_tasks(pending_only=True)
+        return sort_by_time(tasks)
+
+    def filter_tasks(
+        self,
+        pet_name: str | None = None,
+        status: str | None = None,
+        on: date | None = None,
+    ) -> list[Task]:
+        """Filter the owner's tasks by pet name and/or status; see `Owner.filter_tasks`."""
+        return self.owner.filter_tasks(pet_name, status, on)
+
+    def _pet_name(self, task: Task) -> str:
+        """Return the name of the task's pet, or "unknown pet" if it has none."""
+        pet = self.owner.get_pet(task.pet_id)
+        return pet.name if pet else "unknown pet"
+
+    @staticmethod
+    def _window(task: Task, plan_date: date) -> tuple[datetime, datetime]:
+        """Return the (start, end) of the task at its preferred time."""
+        start = datetime.combine(plan_date, task.preferred_time or time.min)
+        return start, start + timedelta(minutes=task.duration_minutes)
+
     def _sort_tasks(self, tasks: list[Task]) -> list[Task]:
-        """Order by priority (high first), then preferred_time (None last),
-        then shorter duration, then title, so the order is deterministic."""
+        """Order fixed tasks first, then by priority (high first), then
+        preferred_time (None last), then shorter duration, then title, so the
+        order is deterministic."""
         return sorted(
             tasks,
             key=lambda t: (
+                not t.fixed,
                 -int(t.priority),
                 t.preferred_time is None,
                 t.preferred_time or time.min,
@@ -280,27 +482,43 @@ class Scheduler:
         )
 
     def _find_slot(
-        self, task: Task, busy: list[tuple[datetime, datetime]], plan_date: date
+        self, task: Task, busy: list[Interval], holds: list[Interval], day: _Day
     ) -> datetime | None:
-        """Return the start of the earliest free slot that fits the task (trying
-        preferred_time first), or None if it does not fit before day_end."""
-        window_start = datetime.combine(plan_date, self.owner.day_start)
-        window_end = datetime.combine(plan_date, self.owner.day_end)
-        length = timedelta(minutes=task.duration_minutes)
+        """Return a start time for the task, or None if it does not fit.
 
+        `busy` is sorted; `holds` are other tasks' preferred windows. Tries, in
+        order: the preferred time if free (a fixed task stops here); the nearest
+        slot that also avoids `holds`; the nearest slot ignoring `holds`."""
         if task.preferred_time is not None:
-            start = datetime.combine(plan_date, task.preferred_time)
-            end = start + length
-            fits = window_start <= start and end <= window_end
-            if fits and not any(s < end and start < e for s, e in busy):
+            start, end = self._window(task, day.date)
+            if day.start <= start and end <= day.end and _is_free(start, end, busy):
                 return start
+            if task.fixed:
+                return None
 
-        cursor = window_start
-        for s, e in sorted(busy):
-            if s - cursor >= length:
-                return cursor
-            cursor = max(cursor, e)
-        return cursor if window_end - cursor >= length else None
+        if holds:
+            slot = self._nearest_slot(task, sorted(busy + holds), day)
+            if slot is not None:
+                return slot
+        return self._nearest_slot(task, busy, day)
+
+    @staticmethod
+    def _nearest_slot(task: Task, blocked: list[Interval], day: _Day) -> datetime | None:
+        """Return the start in a free gap closest to the preferred time (the
+        earliest start if there is no preference), or None if no gap fits.
+        `blocked` must be sorted."""
+        length = timedelta(minutes=task.duration_minutes)
+        target = (
+            datetime.combine(day.date, task.preferred_time)
+            if task.preferred_time is not None
+            else day.start
+        )
+        starts = [
+            min(max(target, gap_start), gap_end - length)  # clamp into the gap
+            for gap_start, gap_end in _free_gaps(blocked, day)
+            if gap_end - gap_start >= length
+        ]
+        return min(starts, key=lambda c: (abs(c - target), c), default=None)
 
     def _explain_scheduled(self, task: Task, start: datetime) -> str:
         """Return why the task was placed at `start`."""

@@ -1,6 +1,8 @@
+from datetime import time
+
 import streamlit as st
 
-from pawpal_system import Category, Owner, Pet, Priority, Task
+from pawpal_system import Category, Owner, Pet, Priority, Scheduler, Task
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
 
@@ -85,11 +87,22 @@ else:
     with col4:
         category = st.selectbox("Category", list(Category), format_func=lambda c: c.value)
 
+    use_time = st.checkbox("Set a preferred time")
+    preferred = st.time_input("Preferred time", value=time(9, 0)) if use_time else None
+
     if st.button("Add task"):
         try:
-            pet.add_task(Task(task_title, category, int(duration), priority))
+            new_task = Task(
+                task_title, category, int(duration), priority, preferred_time=preferred
+            )
+            pet.add_task(new_task)
         except ValueError as err:
             st.error(str(err))
+        else:
+            # Lightweight check: warn about clashes with the new task, never block it.
+            for c in Scheduler(owner).find_conflicts():
+                if any(t is new_task for t in c.tasks):
+                    st.warning(f"Time conflict: {c.message}")
 
     for p in owner.pets:
         st.write(f"**{p.name}**")
@@ -101,6 +114,7 @@ else:
                         "category": t.category.value,
                         "duration_minutes": t.duration_minutes,
                         "priority": t.priority.name.lower(),
+                        "preferred": f"{t.preferred_time:%H:%M}" if t.preferred_time else "-",
                     }
                     for t in p.tasks
                 ]
@@ -111,18 +125,38 @@ else:
 st.divider()
 
 st.subheader("Build Schedule")
-st.caption("This button should call your scheduling logic once you implement it.")
+st.caption("Plans today's due tasks across all of the owner's pets.")
+
+for c in Scheduler(owner).find_conflicts():
+    st.warning(f"Time conflict: {c.message}. The scheduler will move one of them.")
 
 if st.button("Generate schedule"):
-    st.warning(
-        "Not implemented yet. Next step: create your scheduling logic (classes/functions) and call it here."
+    if not owner.get_all_tasks():
+        st.info("Add at least one task first.")
+    else:
+        plan = Scheduler(owner).generate_plan()
+        st.session_state.plan = plan  # keep it so it survives the next rerun
+
+plan = st.session_state.get("plan")
+if plan is not None:
+    st.success(
+        f"{len(plan.scheduled)} task(s) scheduled for {plan.plan_date:%A, %B %d}, "
+        f"{plan.total_minutes()} of {owner.available_minutes} available minutes."
     )
-    st.markdown(
-        """
-Suggested approach:
-1. Design your UML (draft).
-2. Create class stubs (no logic).
-3. Implement scheduling behavior.
-4. Connect your scheduler here and display results.
-"""
-    )
+    if plan.scheduled:
+        st.table(
+            [
+                {
+                    "time": f"{item.start:%H:%M}-{item.end:%H:%M}",
+                    "task": item.task.title,
+                    "pet": item.pet_name,
+                    "priority": item.task.priority.name.lower(),
+                    "why": item.reason,
+                }
+                for item in plan.scheduled
+            ]
+        )
+    if plan.skipped:
+        st.warning("Skipped:")
+        for skipped in plan.skipped:
+            st.write(f"- **{skipped.task.title}**: {skipped.reason}")

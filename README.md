@@ -31,12 +31,12 @@ How the classes work together:
 - An **Owner** has one or more **Pets** and a daily availability window (for example 08:00 to 12:00).
 - Each **Pet** keeps its own list of **Tasks**: a walk, a feeding, a medication. A task has a duration, a priority, an optional preferred time, and can repeat daily or weekly.
 - The **Scheduler** takes an owner and asks it for every pet's due tasks in one call (`owner.get_all_tasks`), so it plans for the whole household.
-- It sorts those tasks by priority, then tries to give each one its preferred time, falling back to the earliest free slot in the owner's window. Tasks that don't fit are skipped.
+- It sorts those tasks by priority, then tries to give each one its preferred time, falling back to the nearest free slot in the owner's window. Tasks that don't fit are skipped.
 - The result is a **DailyPlan**: the scheduled tasks (each with a start and end time and a plain-English reason) and the skipped tasks with the reason they were left out.
 
 The approach is greedy, so it is simple and easy to explain, but not optimal: a long high-priority task can use up time that several short ones needed.
 
-Two basic tests (marking a task complete, adding a task to a pet) are in [tests/test_pawpal.py](tests/test_pawpal.py).
+Tests for the core classes and the scheduling features below are in [tests/test_pawpal.py](tests/test_pawpal.py).
 
 ## Getting started
 
@@ -99,14 +99,23 @@ Sample test output:
 
 ## 📐 Smarter Scheduling
 
-> Fill in once you've implemented scheduling logic.
-
 | Feature | Method(s) | Notes |
 |---------|-----------|-------|
-| Task sorting | | e.g., by priority, duration |
-| Filtering | | e.g., skip tasks if time runs out |
-| Conflict handling | | e.g., overlapping time slots |
-| Recurring tasks | | e.g., daily vs. weekly |
+| Sorting | `Scheduler.sort_by_time()`, `sort_by_time()` | By preferred time, untimed last, then priority |
+| Filtering | `Scheduler.filter_tasks()`, `Owner.filter_tasks()` | By pet name and/or status |
+| Conflict detection | `Scheduler.find_conflicts()` | Overlapping windows; returns warnings |
+| Recurring tasks | `Task.mark_complete()`, `Pet.complete_task()` | Daily and weekly; creates the next occurrence |
+| Slot placement | `Scheduler.generate_plan()`, `_find_slot()` | Nearest free slot; fixed tasks never move |
+
+**Sorting.** `Scheduler.sort_by_time(tasks=None)` returns tasks ordered by `preferred_time`. Tasks without one go last. Ties are broken by priority (high first), then title. With no argument it sorts all pending tasks.
+
+**Filtering.** `Scheduler.filter_tasks(pet_name, status, on)` returns tasks for one pet (case-insensitive) and/or one status: `"pending"` (not completed and due on `on`), `"completed"`, or `"overdue"` (not completed, due before `on`). Both filters can be combined, and an unknown status raises `ValueError`. Sorting and filtering compose: `scheduler.sort_by_time(scheduler.filter_tasks("Mia", "pending"))`.
+
+**Conflict detection.** `Scheduler.find_conflicts()` is a lightweight check: it returns a list of `Conflict` objects with a readable `message` and never raises. It compares each task's preferred window (start plus duration), across pets as well as within one pet, because the owner is one person. It sorts by start time and sweeps once, comparing each task with the window that ends latest so far (O(n log n)). It also flags a window outside the owner's day. Tasks that only touch, such as one ending at 10:00 and another starting at 10:00, are not conflicts. `generate_plan()` still resolves the clash by moving the lower-priority task, so the warning tells the owner what moved. The Streamlit app shows these warnings when a task is added and above the schedule button.
+
+**Recurring tasks.** `Task.mark_complete(on=None)` marks a task done. For a `DAILY` or `WEEKLY` task it returns a new copy with a new id, not completed, and due 1 or 7 days after the later of the old due date and the completion date. `Pet.complete_task()` adds that copy to the pet. Completing a task twice does not create a second copy, and a `ONCE` task creates none.
+
+**Slot placement.** `generate_plan()` places `fixed` tasks first at their exact time, then the rest by priority. A task that cannot have its preferred time goes to the free slot nearest to it. Tasks with no preference avoid other tasks' preferred windows when they can. Tasks that do not fit are skipped with a reason (`DailyPlan.skipped` holds `SkippedTask(task, reason)`).
 
 ## 📸 Demo Walkthrough
 
